@@ -1,11 +1,8 @@
 #include "stdafx.h"
-#include "fwpmu.h"
 #include "objbase.h"
 #include <stdio.h>
 #include "WFP.h"
 #include <Windows.h>
-#include <Psapi.h>
-#include <tlhelp32.h>
 
 
 GUID PROVIDER_KEY =
@@ -16,7 +13,21 @@ GUID PROVIDER_KEY =
     { 0xb8, 0x53, 0x39, 0x1a, 0x41, 0x68, 0x64, 0x1e }
 };
 
-DWORD initWFP(HANDLE* hEngine)
+System::Guid FromGUID(_GUID& guid) {
+    return System::Guid(guid.Data1, guid.Data2, guid.Data3,
+        guid.Data4[0], guid.Data4[1],
+        guid.Data4[2], guid.Data4[3],
+        guid.Data4[4], guid.Data4[5],
+        guid.Data4[6], guid.Data4[7]);
+}
+
+_GUID ToGUID(System::Guid& guid) {
+    array<System::Byte>^ guidData = guid.ToByteArray();
+    pin_ptr<System::Byte> data = &(guidData[0]);
+    return *(_GUID*)data;
+}
+
+DWORD initWFP()
 {
     // Open engine
     FWPM_SESSION0   Session;
@@ -31,8 +42,8 @@ DWORD initWFP(HANDLE* hEngine)
         RPC_C_AUTHN_DEFAULT,
         NULL,
         &Session,
-        hEngine
-    );
+        &hEngine
+        );
 
     if (ERROR_SUCCESS != Status)
     {
@@ -49,7 +60,7 @@ DWORD initWFP(HANDLE* hEngine)
     Provider.displayData.name = L"WFPCustomProvider";
     Provider.displayData.description = L"WFP Custom Provider";
 
-    Status = FwpmProviderAdd0(*hEngine, &Provider, NULL);
+    Status = FwpmProviderAdd0(hEngine, &Provider, NULL);
 
     if (ERROR_SUCCESS != Status && FWP_E_ALREADY_EXISTS != Status)
     {
@@ -67,7 +78,7 @@ DWORD initWFP(HANDLE* hEngine)
     Sublayer.providerKey = (GUID *)&WFP_CUSTOM_PROVIDER;
     Sublayer.weight = 0x123;
 
-    Status = FwpmSubLayerAdd0(*hEngine, &Sublayer, NULL);
+    Status = FwpmSubLayerAdd0(hEngine, &Sublayer, NULL);
 
     if (ERROR_SUCCESS != Status && FWP_E_ALREADY_EXISTS != Status)
     {
@@ -78,79 +89,76 @@ DWORD initWFP(HANDLE* hEngine)
     return ERROR_SUCCESS;
 }
 
-//__declspec(dllexport)
-DWORD addRemotePortBlockFilter(UINT16 target, GUID* guid)
+// удаляем созданный слой и удаляем провайдера перед закрытием hEngine
+DWORD unregister()
 {
-    HANDLE hEngine;
-
-    DWORD Status = initWFP(&hEngine);
-
-    if (ERROR_SUCCESS != Status)
+    DWORD status = FwpmSubLayerDeleteByKey0(hEngine, &WFP_CUSTOM_SUBLAYER);
+    if (ERROR_SUCCESS != status)
     {
-        printf("initWFP failed with status 0x%.8lx.\n", Status);
-        return Status;
+        printf("unregister FwpmSubLayerDeleteByKey0 failed with status 0x%.8lx.\n", status);
+        return status;
     }
 
-    // Register filter
-    GUID  filter_guid;
-    CoCreateGuid(&filter_guid);
-    memcpy(guid, &filter_guid, sizeof(filter_guid));
-    FWPM_FILTER_CONDITION0 Conds[1];
-
-    Conds[0].fieldKey = FWPM_CONDITION_IP_REMOTE_PORT;
-    Conds[0].matchType = FWP_MATCH_EQUAL;
-    Conds[0].conditionValue.type = FWP_UINT16;
-    Conds[0].conditionValue.uint16 = target;
-
-    FWPM_FILTER0 Filter;
-    RtlZeroMemory(&Filter, sizeof(Filter));
-
-    Filter.providerKey = NULL;
-    Filter.displayData.name = L"WFPCustomRemotePortFilter";
-    Filter.displayData.description = L"WFP Custom Remote Port Filter";
-    Filter.layerKey = FWPM_LAYER_ALE_AUTH_CONNECT_V4;
-    Filter.subLayerKey = WFP_CUSTOM_SUBLAYER;
-    Filter.weight.type = FWP_UINT8;
-    Filter.numFilterConditions = 1;
-    Filter.filterCondition = &Conds[0];
-    Filter.action.type = FWP_ACTION_BLOCK;
-
-    UINT64 FilterId;
-
-    Filter.filterKey = filter_guid;
-    Filter.weight.uint8 = 1;
-
-    Status = FwpmFilterAdd0(hEngine, &Filter, NULL, &FilterId);
-
-    if (ERROR_SUCCESS != Status)
+    status = FwpmProviderDeleteByKey(hEngine, &WFP_CUSTOM_PROVIDER);
+    if (ERROR_SUCCESS != status)
     {
-        printf("FwpmFilterAdd0 failed with status 0x%.8lx.\n", Status);
-        return Status;
+        printf("unregister FwpmProviderDeleteByKey failed with status 0x%.8lx.\n", status);
+        return status;
     }
 
-    Status = FwpmEngineClose0(hEngine);
+    return status;
+}
 
-    if (ERROR_SUCCESS != Status)
+DWORD closeWFP()
+{
+    DWORD status = FwpmEngineClose0(hEngine);
+
+    if (ERROR_SUCCESS != status)
     {
-        printf("closeWFP failed with status 0x%.8lx.\n", Status);
-        return Status;
+        printf("closeWFP failed with status 0x%.8lx.\n", status);
+        return status;
     }
 
     return ERROR_SUCCESS;
 }
 
+int ipStringToNumber(const char*       pDottedQuad,
+    unsigned int *    pIpAddr)
+{
+    unsigned int            byte3;
+    unsigned int            byte2;
+    unsigned int            byte1;
+    unsigned int            byte0;
+    char              dummyString[2];
+
+    /* The dummy string with specifier %1s searches for a non-whitespace char
+    * after the last number. If it is found, the result of sscanf will be 5
+    * instead of 4, indicating an erroneous format of the ip-address.
+    */
+    if (sscanf(pDottedQuad, "%u.%u.%u.%u%1s",
+        &byte3, &byte2, &byte1, &byte0, dummyString) == 4)
+    {
+        if ((byte3 < 256)
+            && (byte2 < 256)
+            && (byte1 < 256)
+            && (byte0 < 256)
+            )
+        {
+            *pIpAddr = (byte3 << 24)
+                + (byte2 << 16)
+                + (byte1 << 8)
+                + byte0;
+
+            return 1;
+        }
+    }
+    return 0;
+}
+
 //__declspec(dllexport)
 DWORD addRemoteAddressRangeBlockFilter(UINT32 loAddress, UINT32 hiAddress, GUID* guid)
 {
-    HANDLE hEngine;
-
-    DWORD Status = initWFP(&hEngine);
-
-    if (ERROR_SUCCESS != Status)
-    {
-        printf("initWFP failed with status 0x%.8lx.\n", Status);
-        return Status;
-    }
+    DWORD Status;
 
     // Register filter
     GUID  filter_guid;
@@ -175,79 +183,71 @@ DWORD addRemoteAddressRangeBlockFilter(UINT32 loAddress, UINT32 hiAddress, GUID*
     Filter.providerKey = NULL;
     Filter.displayData.name = L"WFPCustomRemoteAddressRangeFilter";
     Filter.displayData.description = L"WFP Custom Remote Address Range Filter";
-    Filter.layerKey = FWPM_LAYER_ALE_AUTH_CONNECT_V4;
+    Filter.layerKey = FWPM_LAYER_INBOUND_IPPACKET_V4;
     Filter.subLayerKey = WFP_CUSTOM_SUBLAYER;
     Filter.weight.type = FWP_UINT8;
     Filter.numFilterConditions = 1;
     Filter.filterCondition = &Conds[0];
     Filter.action.type = FWP_ACTION_BLOCK;
 
-    UINT64 FilterId;
-
     Filter.filterKey = filter_guid;
     Filter.weight.uint8 = 1;
 
-    Status = FwpmFilterAdd0(hEngine, &Filter, NULL, &FilterId);
+    Status = FwpmFilterAdd0(hEngine, &Filter, NULL, NULL);
 
     if (ERROR_SUCCESS != Status)
     {
         printf("FwpmFilterAdd0 failed with status 0x%.8lx.\n", Status);
-        return Status;
-    }
-
-    Status = FwpmEngineClose0(hEngine);
-
-    if (ERROR_SUCCESS != Status)
-    {
-        printf("closeWFP failed with status 0x%.8lx.\n", Status);
         return Status;
     }
 
     return ERROR_SUCCESS;
 }
 
-DWORD addRemoteAddressBlockFilter(UINT32 Address, GUID* guid)
+DWORD addRemoteAddressBlockFilter(UINT32 Address, GUID* guid_inbound, GUID* guid_outbound)
 {
-    HANDLE hEngine;
-
-    DWORD Status = initWFP(&hEngine);
-
-    if (ERROR_SUCCESS != Status)
-    {
-        printf("initWFP failed with status 0x%.8lx.\n", Status);
-        return Status;
-    }
-
     // Register filter
-    GUID  filter_guid;
-    CoCreateGuid(&filter_guid);
-    memcpy(guid, &filter_guid, sizeof(filter_guid));
-    FWPM_FILTER_CONDITION0 Conds[1];
+    GUID  filter_inbound;
+    CoCreateGuid(&filter_inbound);
+    memcpy(guid_inbound, &filter_inbound, sizeof(filter_inbound));
 
-    Conds[0].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
-    Conds[0].matchType = FWP_MATCH_EQUAL;
-    Conds[0].conditionValue.type = FWP_UINT32;
-    Conds[0].conditionValue.uint32 = Address;
+    GUID  filter_outbound;
+    CoCreateGuid(&filter_outbound);
+    memcpy(guid_outbound, &filter_outbound, sizeof(filter_outbound));
 
-    FWPM_FILTER0 Filter;
-    RtlZeroMemory(&Filter, sizeof(Filter));
 
-    Filter.providerKey = NULL;
-    Filter.displayData.name = L"WFPCustomRemoteAddressRangeFilter";
-    Filter.displayData.description = L"WFP Custom Remote Address Range Filter";
-    Filter.layerKey = FWPM_LAYER_ALE_AUTH_CONNECT_V4;
-    Filter.subLayerKey = WFP_CUSTOM_SUBLAYER;
-    Filter.weight.type = FWP_UINT8;
-    Filter.numFilterConditions = 1;
-    Filter.filterCondition = &Conds[0];
-    Filter.action.type = FWP_ACTION_BLOCK;
+    FWPM_FILTER_CONDITION0 Conds_outbound[1];
+    FWPM_FILTER_CONDITION0 Conds_inbound[1];
+    int conditionsCount = 0;
 
-    UINT64 FilterId;
+    Conds_outbound[conditionsCount].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
+    Conds_outbound[conditionsCount].matchType = FWP_MATCH_EQUAL;
+    Conds_outbound[conditionsCount].conditionValue.type = FWP_UINT32;
+    Conds_outbound[conditionsCount].conditionValue.uint32 = Address;
 
-    Filter.filterKey = filter_guid;
-    Filter.weight.uint8 = 1;
+    Conds_inbound[conditionsCount].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
+    Conds_inbound[conditionsCount].matchType = FWP_MATCH_EQUAL;
+    Conds_inbound[conditionsCount].conditionValue.type = FWP_UINT32;
+    Conds_inbound[conditionsCount].conditionValue.uint32 = Address;
+    conditionsCount++;
 
-    Status = FwpmFilterAdd0(hEngine, &Filter, NULL, &FilterId);
+    FWPM_FILTER0 FilterOutbound;
+    RtlZeroMemory(&FilterOutbound, sizeof(FilterOutbound));
+
+    FilterOutbound.providerKey = NULL;
+    FilterOutbound.displayData.name = L"WFPCustomRemoteAddressRangeFilter";
+    FilterOutbound.displayData.description = L"WFP Custom Remote Address Range Filter";
+    FilterOutbound.layerKey = FWPM_LAYER_OUTBOUND_IPPACKET_V4;
+    FilterOutbound.subLayerKey = WFP_CUSTOM_SUBLAYER;
+    FilterOutbound.weight.type = FWP_UINT8;
+    FilterOutbound.numFilterConditions = 1;
+    FilterOutbound.filterCondition = &Conds_outbound[0];
+    FilterOutbound.action.type = FWP_ACTION_BLOCK;
+
+    FilterOutbound.filterKey = filter_outbound;
+    FilterOutbound.weight.uint8 = 1;
+
+    DWORD Status = FwpmFilterAdd0(hEngine, &FilterOutbound, NULL, NULL/*&FilterId*/);
 
     if (ERROR_SUCCESS != Status)
     {
@@ -255,11 +255,27 @@ DWORD addRemoteAddressBlockFilter(UINT32 Address, GUID* guid)
         return Status;
     }
 
-    Status = FwpmEngineClose0(hEngine);
+    FWPM_FILTER0 FilterInbound;
+    RtlZeroMemory(&FilterInbound, sizeof(FilterInbound));
+
+    FilterInbound.providerKey = NULL;
+    FilterInbound.displayData.name = L"WFPCustomRemoteAddressRangeFilter";
+    FilterInbound.displayData.description = L"WFP Custom Remote Address Range Filter";
+    FilterInbound.layerKey = FWPM_LAYER_INBOUND_IPPACKET_V4;
+    FilterInbound.subLayerKey = WFP_CUSTOM_SUBLAYER;
+    FilterInbound.weight.type = FWP_UINT8;
+    FilterInbound.numFilterConditions = 1;
+    FilterInbound.filterCondition = &Conds_inbound[0];
+    FilterInbound.action.type = FWP_ACTION_BLOCK;
+
+    FilterInbound.filterKey = filter_inbound;
+    FilterInbound.weight.uint8 = 1;
+
+    Status = FwpmFilterAdd0(hEngine, &FilterInbound, NULL, NULL);
 
     if (ERROR_SUCCESS != Status)
     {
-        printf("closeWFP failed with status 0x%.8lx.\n", Status);
+        printf("FwpmFilterAdd0 failed with status 0x%.8lx.\n", Status);
         return Status;
     }
 
@@ -269,9 +285,7 @@ DWORD addRemoteAddressBlockFilter(UINT32 Address, GUID* guid)
 //__declspec(dllexport)
 DWORD removeFilter(GUID guid)
 {
-    HANDLE hEngine;
-
-    DWORD Status = initWFP(&hEngine);
+    DWORD Status = ERROR_SUCCESS;
 
     if (ERROR_SUCCESS != Status)
     {
@@ -284,14 +298,6 @@ DWORD removeFilter(GUID guid)
     if (ERROR_SUCCESS != Status)
     {
         printf("FwpmFilterDeleteByKey0 failed with status 0x%.8lx.\n", Status);
-        return Status;
-    }
-
-    Status = FwpmEngineClose0(hEngine);
-
-    if (ERROR_SUCCESS != Status)
-    {
-        printf("closeWFP failed with status 0x%.8lx.\n", Status);
         return Status;
     }
 
